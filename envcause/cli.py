@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -15,15 +16,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--good", required=True, help="Known-good .env file")
     parser.add_argument("--bad", required=True, help="Known-bad .env file")
-    parser.add_argument(
+    matchers = parser.add_mutually_exclusive_group()
+    matchers.add_argument(
         "--contains",
         help="Treat the run as failing only when stdout/stderr contains this text",
+    )
+    matchers.add_argument(
+        "--matches",
+        metavar="REGEX",
+        help="Treat the run as failing only when stdout/stderr matches this regex",
+    )
+    matchers.add_argument(
+        "--junit",
+        metavar="PATH",
+        help="Treat the run as failing when this JUnit XML report contains a failure or error",
     )
     parser.add_argument("--repeat", type=int, default=1, help="Require failure to reproduce N times (default: 1)")
     parser.add_argument("--timeout", type=float, help="Per-run timeout in seconds")
     parser.add_argument("--cwd", help="Working directory for the reproduction command")
     parser.add_argument("--max-tests", type=int, help="Maximum candidate subsets tested during reduction")
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable in-memory candidate result caching",
+    )
+    parser.add_argument(
+        "--cache-file",
+        metavar="PATH",
+        help="Reuse candidate results across invocations using this cache file",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show each candidate test as the reduction runs",
+    )
     parser.add_argument("--write-repro", metavar="PATH", help="Write the reduced bad configuration to a .env file")
+    parser.add_argument("--report-json", metavar="PATH", help="Write a machine-readable reduction report")
     parser.add_argument(
         "--show-values",
         action="store_true",
@@ -44,6 +72,9 @@ def _strip_separator(command: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     command = _strip_separator(args.command)
+    if args.no_cache and args.cache_file:
+        print("envcause: error: --no-cache cannot be combined with --cache-file", file=sys.stderr)
+        return 2
     if not command:
         print("envcause: error: provide a reproduction command after --", file=sys.stderr)
         return 2
@@ -61,6 +92,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Command     : {' '.join(command)}")
         if args.contains:
             print(f"Failure     : output contains {args.contains!r}")
+        elif args.matches:
+            print(f"Failure     : output matches {args.matches!r}")
+        elif args.junit:
+            print(f"Failure     : JUnit report {args.junit} contains a failure or error")
         else:
             print("Failure     : non-zero exit code")
         if args.repeat > 1:
@@ -68,15 +103,27 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print("Verifying known-good and known-bad configs, then reducing...")
 
+        def show_progress(test_no: int, command_runs: int, candidate_size: int, cached: bool) -> None:
+            source = "cached" if cached else f"{command_runs} command runs"
+            print(
+                f"[candidate {test_no}] {candidate_size} changed variables ({source})",
+                file=sys.stderr,
+            )
+
         result = reduce_environment(
             good,
             bad,
             command,
             contains=args.contains,
+            matches=args.matches,
+            junit=args.junit,
             timeout=args.timeout,
             cwd=args.cwd,
             repeat=args.repeat,
             max_tests=args.max_tests,
+            cache=not args.no_cache,
+            cache_path=args.cache_file,
+            progress=show_progress if args.progress else None,
         )
 
         print()
@@ -85,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Original differing variables : {len(all_changes)}")
         print(f"Failure-inducing variables    : {len(result.changes)}")
         print(f"Command executions            : {result.total_runs}")
+        if result.cache_hits:
+            print(f"Cached candidate results      : {result.cache_hits}")
         print()
         print("1-minimal failure-inducing change set:")
         for change in result.changes:
@@ -103,6 +152,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote reproduction config: {args.write_repro}")
             if not args.show_values:
                 print("Note: the file contains real values even though terminal output may be redacted.")
+
+        if args.report_json:
+            report = {
+                "schema_version": 1,
+                "good_config": str(Path(args.good)),
+                "bad_config": str(Path(args.bad)),
+                "command": command,
+                "failure_match": (
+                    {"contains": args.contains}
+                    if args.contains
+                    else {"matches": args.matches}
+                    if args.matches
+                    else {"junit": args.junit}
+                    if args.junit
+                    else {"nonzero_exit": True}
+                ),
+                "original_difference_count": len(all_changes),
+                "failure_inducing_count": len(result.changes),
+                "command_executions": result.total_runs,
+                "cache_hits": result.cache_hits,
+                "changes": [
+                    {
+                        "key": change.key,
+                        "good": redact_value(change.key, change.good, show_values=args.show_values),
+                        "bad": redact_value(change.key, change.bad, show_values=args.show_values),
+                    }
+                    for change in result.changes
+                ],
+            }
+            Path(args.report_json).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            print()
+            print(f"Wrote JSON report: {args.report_json}")
         return 0
 
     except EnvCauseError as exc:

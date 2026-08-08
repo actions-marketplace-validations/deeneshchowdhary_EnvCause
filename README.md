@@ -54,6 +54,26 @@ envcause \
 
 This is useful when the command can fail for unrelated reasons.
 
+For patterns that vary between runs, use a Python regular expression:
+
+```bash
+envcause --good good.env --bad bad.env --matches 'HTTP (500|503)' -- pytest -q
+```
+
+`--contains` and `--matches` search the combined stdout and stderr.
+
+### Match failures from JUnit XML
+
+```bash
+envcause \
+  --good good.env \
+  --bad bad.env \
+  --junit test-results.xml \
+  -- pytest --junitxml=test-results.xml
+```
+
+A candidate fails when the report contains a `<failure>` or `<error>` element. The command should overwrite the report on every run. Relative report paths are resolved from `--cwd` when supplied.
+
 ### Reduce flaky failures
 
 ```bash
@@ -73,6 +93,34 @@ envcause \
 ```
 
 The generated file contains the actual bad-state values. Terminal output redacts values whose variable names look secret-sensitive unless `--show-values` is supplied.
+
+### Save a machine-readable report
+
+```bash
+envcause --good good.env --bad bad.env --report-json result.json -- pytest -q
+```
+
+The JSON report includes the command, matching mode, run and cache counts, and the reduced changes. Secret-looking values remain redacted unless `--show-values` is supplied.
+
+### Candidate caching
+
+EnvCause caches candidate results in memory during each reduction, avoiding duplicate command executions when the delta-debugging search revisits a change set. Use `--no-cache` when the reproduction command is stateful and every candidate must be rerun.
+
+To reuse results across invocations, provide a cache file:
+
+```bash
+envcause --good good.env --bad bad.env --cache-file .envcause-cache.json -- pytest -q
+```
+
+The cache stores SHA-256 fingerprints and pass/fail outcomes, not raw environment values. Fingerprints include the complete execution environment, command, matcher, working directory, timeout, and repeat count. Known-good and known-bad configurations are always verified with fresh runs before cached candidates are used.
+
+### Follow long reductions
+
+```bash
+envcause --good good.env --bad bad.env --progress -- pytest -q
+```
+
+Progress is written to stderr and shows the candidate number, number of changed variables, command-run count, and whether the result came from cache.
 
 ## How the configuration model works
 
@@ -109,8 +157,6 @@ Potential next steps:
 - JSON / YAML / TOML config reduction
 - parallel candidate execution
 - Docker / Kubernetes environment adapters
-- JUnit-style result matching
-- cache candidate results by config hash
 - `envcause explain` reports
 - GitHub Action integration
 - multiple known-good / known-bad runs for nondeterministic systems
