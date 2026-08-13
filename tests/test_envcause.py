@@ -14,6 +14,7 @@ from envcause.adapters import DockerAdapter, KubernetesAdapter
 from envcause.cli import main
 from envcause.core import EnvCauseError, diff_envs, parse_dotenv, redact_value, reduce_environment, run_command, write_repro
 from envcause.github_action import build_argv as build_github_action_argv, run as run_github_action
+from envcause.structured import build_config, diff_configs, load_config
 
 
 class ParseDotenvTests(unittest.TestCase):
@@ -48,6 +49,113 @@ class ParseDotenvTests(unittest.TestCase):
             path.write_text("NOPE\n", encoding="utf-8")
             with self.assertRaises(EnvCauseError):
                 parse_dotenv(path)
+
+
+class StructuredConfigTests(unittest.TestCase):
+    def test_nested_diff_and_build_handle_added_and_removed_subtrees(self):
+        good = {"database": {"host": "localhost", "legacy": {"enabled": True}}, "workers": 2}
+        bad = {"database": {"host": "db.internal", "tls": {"enabled": True}}, "workers": 2}
+        changes = diff_configs(good, bad)
+        self.assertEqual(
+            [change.key for change in changes],
+            ["/database/host", "/database/legacy", "/database/tls"],
+        )
+        self.assertEqual(build_config(good, changes), bad)
+
+    def test_json_cli_reduces_nested_paths_and_leaves_minimal_candidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            good_path = root / "good.json"
+            bad_path = root / "bad.json"
+            candidate = root / "candidate.json"
+            report = root / "report.json"
+            good = {"auth": {"enabled": False, "algorithm": "HS256"}, "noise": 0}
+            bad = {"auth": {"enabled": True, "algorithm": "RS256"}, "noise": 1}
+            good_path.write_text(json.dumps(good), encoding="utf-8")
+            bad_path.write_text(json.dumps(bad), encoding="utf-8")
+            code = (
+                "import json,sys; c=json.load(open(sys.argv[1])); "
+                "sys.exit(1 if c['auth']['enabled'] and c['auth']['algorithm']=='RS256' else 0)"
+            )
+            with redirect_stdout(io.StringIO()):
+                exit_code = main([
+                    "--good", str(good_path), "--bad", str(bad_path),
+                    "--config-output", str(candidate), "--report-json", str(report), "--",
+                    sys.executable, "-c", code, str(candidate),
+                ])
+            self.assertEqual(exit_code, 0)
+            result = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {change["key"] for change in result["changes"]},
+                {"/auth/enabled", "/auth/algorithm"},
+            )
+            self.assertEqual(json.loads(candidate.read_text(encoding="utf-8"))["noise"], 0)
+
+    def test_structured_cli_requires_distinct_candidate_output(self):
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, redirect_stderr(stderr):
+            path = Path(td) / "config.json"
+            path.write_text("{}", encoding="utf-8")
+            exit_code = main([
+                "--good", str(path), "--bad", str(path),
+                "--config-output", str(path), "--", sys.executable, "-c", "pass",
+            ])
+        self.assertEqual(exit_code, 2)
+        self.assertIn("must not overwrite", stderr.getvalue())
+
+
+class ExplainTests(unittest.TestCase):
+    def _report(self, root: Path) -> Path:
+        report = root / "report.json"
+        report.write_text(json.dumps({
+            "schema_version": 1,
+            "good_config": "good.yaml",
+            "bad_config": "bad.yaml",
+            "config_format": "yaml",
+            "config_output": "candidate.yaml",
+            "reproduction_config": None,
+            "command": ["python", "reproduce.py", "candidate.yaml"],
+            "execution": {"type": "local"},
+            "failure_match": {"contains": "connection refused"},
+            "original_difference_count": 8,
+            "failure_inducing_count": 1,
+            "command_executions": 7,
+            "cache_hits": 2,
+            "changes": [{"key": "/database/host", "good": "localhost", "bad": "db.internal"}],
+        }), encoding="utf-8")
+        return report
+
+    def test_explain_renders_terminal_diagnosis(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self._report(Path(td))
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(main(["explain", str(report)]), 0)
+            text = stdout.getvalue()
+            self.assertIn("EnvCause diagnosis", text)
+            self.assertIn("/database/host: localhost -> db.internal", text)
+            self.assertIn("python reproduce.py candidate.yaml", text)
+
+    def test_explain_writes_markdown(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report = self._report(root)
+            output = root / "diagnosis.md"
+            self.assertEqual(main([
+                "explain", str(report), "--format", "markdown", "--output", str(output),
+            ]), 0)
+            text = output.read_text(encoding="utf-8")
+            self.assertIn("# EnvCause diagnosis", text)
+            self.assertIn("| `/database/host` | `localhost` | `db.internal` |", text)
+
+    def test_explain_rejects_non_report_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "bad.json"
+            report.write_text("{}", encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(main(["explain", str(report)]), 2)
+            self.assertIn("Unsupported or incomplete", stderr.getvalue())
 
 
 class AdapterTests(unittest.TestCase):
@@ -288,6 +396,7 @@ class ReductionTests(unittest.TestCase):
 
     def test_secret_redaction_does_not_hide_feature_auth_flag(self):
         self.assertEqual(redact_value("API_TOKEN", "abc"), "<REDACTED>")
+        self.assertEqual(redact_value("/service/api_token", "abc"), "<REDACTED>")
         self.assertEqual(redact_value("FEATURE_NEW_AUTH", "true"), "true")
 
     def test_write_repro(self):

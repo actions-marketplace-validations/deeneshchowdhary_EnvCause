@@ -7,9 +7,11 @@
 [![Python](https://img.shields.io/pypi/pyversions/envcause.svg)](https://pypi.org/project/envcause/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-EnvCause compares a known-good `.env` file with a known-bad one, repeatedly runs your reproduction command, and uses delta debugging to reduce all changed variables to a **1-minimal failure-inducing set**.
+EnvCause compares a known-good configuration with a known-bad one, repeatedly
+runs your reproduction command, and uses delta debugging to reduce the changes
+to a **1-minimal failure-inducing set**. It supports `.env`, JSON, YAML, and TOML.
 
-It is deliberately local and dependency-free: your environment values are not sent anywhere.
+It runs deliberately and entirely locally: your configuration values are not sent anywhere.
 
 ![EnvCause finds two failure-inducing settings among many configuration changes](https://raw.githubusercontent.com/deeneshchowdhary/EnvCause/master/assets/envcause-demo.gif)
 
@@ -21,7 +23,9 @@ pipx install envcause
 
 Alternatively, install it inside a virtual environment with `python -m pip install envcause`.
 
-## Example
+## Quick start
+
+### Environment files
 
 ```bash
 envcause \
@@ -41,6 +45,21 @@ Failure-inducing variables    : 2
   JWT_ALGORITHM: HS256 -> RS256
 ```
 
+### JSON, YAML, and TOML
+
+For a structured config, provide a separate candidate path and make the
+reproduction command read it:
+
+```bash
+envcause \
+  --good config/good.yaml \
+  --bad config/bad.yaml \
+  --config-output /tmp/envcause-candidate.yaml \
+  -- python reproduce.py /tmp/envcause-candidate.yaml
+```
+
+The final reduced candidate remains at `--config-output` after EnvCause exits.
+
 ## Why this is useful
 
 Configuration failures often come from many changes landing together: feature flags, URLs, credentials, timeouts, pool sizes, provider choices, or deployment-specific switches. Testing them manually is slow, and checking one variable at a time misses failures caused by combinations.
@@ -50,10 +69,24 @@ EnvCause searches combinations automatically.
 ## Usage
 
 ```text
-envcause --good GOOD.env --bad BAD.env [options] -- COMMAND [ARGS...]
+envcause --good GOOD --bad BAD [options] -- COMMAND [ARGS...]
 ```
 
 By default, a non-zero process exit code means the failure reproduced.
+
+The format is inferred from the `--good` filename:
+
+| Extension | Format | Candidate delivery |
+| --- | --- | --- |
+| `.env` or no extension | dotenv | Applied to the command environment |
+| `.json` | JSON | Written to `--config-output` |
+| `.yaml`, `.yml` | YAML | Written to `--config-output` |
+| `.toml` | TOML | Written to `--config-output` |
+
+Use `--format dotenv|json|yaml|toml` when the extension is ambiguous.
+Structured paths use JSON Pointer notation. Objects and tables are reduced
+recursively; arrays are atomic changes. `--config-output` must differ from both
+inputs. Generated candidates preserve data, but not comments or formatting.
 
 ### Match a specific error instead
 
@@ -105,7 +138,10 @@ envcause \
   -- pytest -q
 ```
 
-The generated file contains the actual bad-state values. Terminal output redacts values whose variable names look secret-sensitive unless `--show-values` is supplied.
+The generated file contains the good baseline plus the minimal bad-state
+changes. For structured configs, its extension determines the output format;
+an extensionless path uses the input format. Terminal output redacts values
+whose names or paths look secret-sensitive unless `--show-values` is supplied.
 
 ### Save a machine-readable report
 
@@ -114,6 +150,25 @@ envcause --good good.env --bad bad.env --report-json result.json -- pytest -q
 ```
 
 The JSON report includes the command, matching mode, run and cache counts, and the reduced changes. Secret-looking values remain redacted unless `--show-values` is supplied.
+
+### Explain and share a result
+
+Turn a saved report into a concise terminal diagnosis without rerunning the
+reproduction command:
+
+```bash
+envcause explain result.json
+```
+
+Generate a Markdown artifact for an issue, pull request, or incident report:
+
+```bash
+envcause explain result.json --format markdown --output diagnosis.md
+```
+
+The explanation includes the reduced changes, failure matcher, execution mode,
+reproduction command, run counts, and minimal config location when available.
+It cannot reveal values that were redacted when the JSON report was created.
 
 ### Candidate caching
 
@@ -125,7 +180,11 @@ To reuse results across invocations, provide a cache file:
 envcause --good good.env --bad bad.env --cache-file .envcause-cache.json -- pytest -q
 ```
 
-The cache stores SHA-256 fingerprints and pass/fail outcomes, not raw environment values. Fingerprints include the relevant execution environment, command, matcher, working directory, timeout, and repeat count. Volatile GitHub runner bookkeeping such as per-step output paths and run counters is ignored. Known-good and known-bad configurations are always verified with fresh runs before cached candidates are used.
+The cache stores SHA-256 fingerprints and pass/fail outcomes, not raw
+configuration values. Fingerprints account for the inputs, execution environment,
+command, matcher, working directory, timeout, and repeat count. Known-good and
+known-bad configurations are always verified with fresh runs before cached
+candidates are used.
 
 ### Follow long reductions
 
@@ -133,7 +192,8 @@ The cache stores SHA-256 fingerprints and pass/fail outcomes, not raw environmen
 envcause --good good.env --bad bad.env --progress -- pytest -q
 ```
 
-Progress is written to stderr and shows the candidate number, number of changed variables, command-run count, and whether the result came from cache.
+Progress is written to stderr and shows the candidate number, number of changed
+variables or paths, command-run count, and whether the result came from cache.
 
 ## Docker and Kubernetes
 
@@ -219,7 +279,21 @@ jobs:
           path: ${{ steps.envcause.outputs.report-path }}
 ```
 
-The action installs no project dependencies of its own and executes the command without a shell. The `command` input supports shell-style quoting for arguments, but shell operators such as pipes and redirects are not interpreted.
+The action installs EnvCause and its format dependencies, then executes the
+command without a shell. The `command` input supports shell-style quoting for
+arguments, but shell operators such as pipes and redirects are not interpreted.
+
+For structured files, also set `format` and `config-output`; the command must
+read that candidate path:
+
+```yaml
+with:
+  good: config/good.toml
+  bad: config/bad.toml
+  format: toml
+  config-output: /tmp/envcause-candidate.toml
+  command: python reproduce.py /tmp/envcause-candidate.toml
+```
 
 By default it:
 
@@ -228,13 +302,18 @@ By default it:
 - shows reduction progress in the action log
 - adds a result table to the GitHub job summary
 
-Available outputs are `report-path`, `repro-path`, `failure-inducing-count`, `command-executions`, and `cache-hits`. Set `write-repro` to create a minimal `.env` file; unlike the default JSON report, that file contains the real bad-state values and should be handled as a secret-bearing artifact. Set `show-values: "true"` only when exposing configuration values in logs and summaries is acceptable.
+Available outputs are `report-path`, `repro-path`, `failure-inducing-count`,
+`command-executions`, and `cache-hits`. Set `write-repro` to create a minimal
+configuration file; unlike the default JSON report, that file contains real
+bad-state values and should be handled as a secret-bearing artifact.
 
 The repository's own [CI workflow](.github/workflows/ci.yml) exercises the action locally on every push and pull request.
 
 ## How the configuration model works
 
-EnvCause starts from the **good file as the baseline**. Each differing variable can then be switched independently into its state from the bad file.
+EnvCause starts from the **good file as the baseline**. Each differing variable
+or structured path can then be switched independently into its state from the
+bad file.
 
 This also handles variables that exist in only one file:
 
@@ -242,6 +321,9 @@ This also handles variables that exist in only one file:
 - present only in `good.env` → candidate change unsets the variable
 
 Variables inherited from the parent shell remain available unless overridden by the supplied files.
+
+For JSON, YAML, and TOML, added or removed objects are treated as one change when
+the entire subtree exists on only one side. Lists are also treated atomically.
 
 ## Important limitation: 1-minimal is not globally smallest
 
@@ -251,23 +333,31 @@ That tradeoff keeps the number of command executions practical.
 
 ## Safety
 
-`.env` files commonly contain secrets. EnvCause:
+Configuration files commonly contain secrets. EnvCause:
 
 - runs locally
 - has no telemetry or network code
-- redacts values for names containing terms such as `SECRET`, `TOKEN`, `PASSWORD`, `KEY`, or `AUTH`
-- shows variable names by default because names themselves can still be sensitive in some organizations
+- redacts values for names or paths containing terms such as `SECRET`, `TOKEN`, `PASSWORD`, or `KEY`
+- shows variable names and paths by default; those can still be sensitive
+- writes real values to `--config-output` and `--write-repro`
 
 Use `--show-values` only when appropriate.
 
-## MVP roadmap
+## Roadmap
 
-Potential next steps:
+Completed:
 
-- JSON / YAML / TOML config reduction
-- parallel candidate execution
-- `envcause explain` reports
-- multiple known-good / known-bad runs for nondeterministic systems
+- [x] `.env` reduction
+- [x] JSON, YAML, and TOML reduction
+- [x] Docker, Kubernetes, and GitHub Actions integration
+- [x] `envcause explain` terminal and Markdown reports
+
+Potential next steps, in suggested order:
+
+1. Multiple known-good and known-bad verification runs for nondeterministic
+   systems.
+2. Parallel candidate execution. Structured candidates need isolated per-run
+   files, so this requires more execution-model work than baseline verification.
 
 ## Development
 
@@ -275,6 +365,7 @@ Potential next steps:
 python -m unittest discover -s tests -v
 ```
 
-No runtime dependencies are required.
+YAML and TOML serialization use PyYAML and tomli-w; they are installed with the
+package.
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and pull-request guidance.

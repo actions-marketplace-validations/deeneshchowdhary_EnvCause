@@ -75,6 +75,8 @@ def build_argv() -> tuple[list[str], Path, Path | None]:
     argv = ["--good", good, "--bad", bad, "--report-json", str(report)]
 
     optional_values = {
+        "--format": _input("FORMAT"),
+        "--config-output": _input("CONFIG_OUTPUT"),
         "--contains": _input("CONTAINS"),
         "--matches": _input("MATCHES"),
         "--junit": _input("JUNIT"),
@@ -91,7 +93,7 @@ def build_argv() -> tuple[list[str], Path, Path | None]:
     }
     for flag, value in optional_values.items():
         if value:
-            if flag == "--cache-file":
+            if flag in {"--cache-file", "--config-output"}:
                 cache_path = _absolute(value)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 value = str(cache_path)

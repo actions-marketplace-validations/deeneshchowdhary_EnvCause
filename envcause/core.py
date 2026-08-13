@@ -278,12 +278,15 @@ def reproduce(
     cwd: str | None,
     repeat: int,
     adapter: ExecutionAdapter | None = None,
+    before_run: Callable[[], None] | None = None,
 ) -> tuple[bool, RunResult, int]:
     """Return true only if the target failure reproduces on every repeat."""
     if repeat < 1:
         raise EnvCauseError("--repeat must be at least 1")
     last: RunResult | None = None
     for run_no in range(1, repeat + 1):
+        if before_run is not None:
+            before_run()
         last = run_command(
             command,
             env,
@@ -386,6 +389,10 @@ def reduce_environment(
     cache_path: str | os.PathLike[str] | None = None,
     progress: Callable[[int, int, int, bool], None] | None = None,
     adapter: ExecutionAdapter | None = None,
+    changes_override: Sequence[EnvChange] | None = None,
+    candidate_setup: Callable[[Sequence[EnvChange]], None] | None = None,
+    inject_environment: bool = True,
+    cache_identity: Mapping[str, object] | None = None,
 ) -> ReductionResult:
     if not command:
         raise EnvCauseError("No reproduction command supplied")
@@ -398,12 +405,19 @@ def reduce_environment(
             raise EnvCauseError(f"Invalid failure regex: {exc}") from exc
 
     process_env = process_env or os.environ
-    changes = diff_envs(good, bad)
+    changes = list(changes_override) if changes_override is not None else diff_envs(good, bad)
     if not changes:
-        raise EnvCauseError("Good and bad environment files contain no differences")
+        raise EnvCauseError("Good and bad configuration files contain no differences")
 
     def env_for(subset: Sequence[EnvChange]) -> dict[str, str]:
+        if not inject_environment:
+            return dict(process_env)
         return build_environment(process_env, good, changes, (c.key for c in subset))
+
+    def setup_for(subset: Sequence[EnvChange]) -> Callable[[], None] | None:
+        if candidate_setup is None:
+            return None
+        return lambda: candidate_setup(subset)
 
     good_failed, good_result, good_runs = reproduce(
         command,
@@ -415,6 +429,7 @@ def reduce_environment(
         cwd=cwd,
         repeat=repeat,
         adapter=adapter,
+        before_run=setup_for([]),
     )
     if good_failed:
         target = _failure_description(contains, matches, junit)
@@ -430,6 +445,7 @@ def reduce_environment(
         cwd=cwd,
         repeat=repeat,
         adapter=adapter,
+        before_run=setup_for(changes),
     )
     if not bad_failed:
         target = _failure_description(contains, matches, junit)
@@ -460,6 +476,7 @@ def reduce_environment(
             cwd=cwd,
             repeat=repeat,
             adapter_identity=adapter.cache_identity if adapter else None,
+            extra_identity={**(cache_identity or {}), "changes": sorted(change.key for change in subset)},
         )
         if cache and persistent_key in persistent_cache:
             cache_hits += 1
@@ -477,6 +494,7 @@ def reduce_environment(
             cwd=cwd,
             repeat=repeat,
             adapter=adapter,
+            before_run=setup_for(subset),
         )
         command_runs += used
         if cache:
@@ -523,6 +541,7 @@ def _candidate_hash(
     cwd: str | None,
     repeat: int,
     adapter_identity: Mapping[str, object] | None,
+    extra_identity: Mapping[str, object] | None = None,
 ) -> str:
     payload = {
         "command": list(command),
@@ -534,8 +553,9 @@ def _candidate_hash(
         "cwd": cwd,
         "repeat": repeat,
         "adapter": adapter_identity,
+        "extra": extra_identity,
     }
-    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -568,7 +588,7 @@ def redact_value(key: str, value: object, *, show_values: bool = False) -> str:
     value_s = str(value)
     if show_values:
         return value_s
-    if _SECRET_RE.search(key):
+    if _SECRET_RE.search(key.replace("/", "_").replace(".", "_")):
         return "<REDACTED>"
     if len(value_s) > 80:
         return value_s[:77] + "..."

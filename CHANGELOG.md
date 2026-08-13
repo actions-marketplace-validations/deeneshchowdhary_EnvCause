@@ -2,6 +2,20 @@
 
 All notable changes to EnvCause are documented here.
 
+## 0.3.0 - 2026-08-13
+
+### Added
+
+- Nested JSON, YAML, and TOML configuration reduction
+- Atomic candidate-file writes and JSON Pointer paths in reports
+- Structured configuration inputs for the reusable GitHub Action
+- `envcause explain` terminal and Markdown diagnosis reports
+
+### Changed
+
+- Arrays are reduced as atomic values to keep candidate documents valid
+- Secret redaction now recognizes nested structured-config paths
+
 ## 0.2.0 - 2026-08-09
 
 ### Added

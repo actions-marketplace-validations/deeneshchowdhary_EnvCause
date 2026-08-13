@@ -1,5 +1,5 @@
 name: EnvCause
-description: Find the 1-minimal environment change set that reproduces a failure
+description: Find the 1-minimal configuration change set that reproduces a failure
 author: Deenesh Chowdhary
 
 branding:
@@ -8,11 +8,18 @@ branding:
 
 inputs:
   good:
-    description: Path to the known-good .env file
+    description: Path to the known-good configuration file
     required: true
   bad:
-    description: Path to the known-bad .env file
+    description: Path to the known-bad configuration file
     required: true
+  format:
+    description: Configuration format (auto, dotenv, json, yaml, or toml)
+    required: false
+    default: auto
+  config-output:
+    description: Candidate path read by the command; required for JSON, YAML, and TOML
+    required: false
   command:
     description: Reproduction command, parsed with shell-style quoting but executed without a shell
     required: true
@@ -104,13 +111,18 @@ runs:
       uses: actions/setup-python@v7
       with:
         python-version: "3.12"
-    - name: Reduce environment changes
+    - name: Install EnvCause
+      shell: bash
+      run: python -m pip install "${{ github.action_path }}"
+    - name: Reduce configuration changes
       id: envcause
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}
         INPUT_GOOD: ${{ inputs.good }}
         INPUT_BAD: ${{ inputs.bad }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_CONFIG_OUTPUT: ${{ inputs.config-output }}
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_DOCKER_IMAGE: ${{ inputs.docker-image }}
         INPUT_DOCKER_RUN_ARGS: ${{ inputs.docker-run-args }}

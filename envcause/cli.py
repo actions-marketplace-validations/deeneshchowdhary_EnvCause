@@ -7,16 +7,29 @@ from pathlib import Path
 
 from .adapters import DockerAdapter, KubernetesAdapter
 from .core import EnvCauseError, diff_envs, parse_dotenv, redact_value, reduce_environment, shell_assignment, write_repro
+from .structured import build_config, detect_format, diff_configs, load_config, write_config
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="envcause",
         description="Find the smallest configuration change set that reproduces a failure.",
-        epilog="Example: envcause --good .env.local --bad .env.staging -- pytest -q",
+        epilog=(
+            "Reduce: envcause --good good.env --bad bad.env -- pytest -q\n"
+            "Explain: envcause explain report.json --format markdown"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--good", required=True, help="Known-good .env file")
-    parser.add_argument("--bad", required=True, help="Known-bad .env file")
+    parser.add_argument("--good", required=True, help="Known-good configuration file")
+    parser.add_argument("--bad", required=True, help="Known-bad configuration file")
+    parser.add_argument(
+        "--format", choices=("auto", "dotenv", "json", "yaml", "toml"), default="auto",
+        help="Configuration format (default: infer from --good extension)",
+    )
+    parser.add_argument(
+        "--config-output", metavar="PATH",
+        help="Candidate file read by the command (required for JSON/YAML/TOML)",
+    )
     execution = parser.add_mutually_exclusive_group()
     execution.add_argument(
         "--docker-image",
@@ -72,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show each candidate test as the reduction runs",
     )
-    parser.add_argument("--write-repro", metavar="PATH", help="Write the reduced bad configuration to a .env file")
+    parser.add_argument("--write-repro", metavar="PATH", help="Write the reduced bad configuration")
     parser.add_argument("--report-json", metavar="PATH", help="Write a machine-readable reduction report")
     parser.add_argument(
         "--show-values",
@@ -92,7 +105,16 @@ def _strip_separator(command: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    actual_argv = list(sys.argv[1:] if argv is None else argv)
+    if actual_argv and actual_argv[0] == "explain":
+        from .explain import explain_main
+
+        try:
+            return explain_main(actual_argv[1:])
+        except EnvCauseError as exc:
+            print(f"envcause: {exc}", file=sys.stderr)
+            return 2
+    args = build_parser().parse_args(actual_argv)
     command = _strip_separator(args.command)
     if args.no_cache and args.cache_file:
         print("envcause: error: --no-cache cannot be combined with --cache-file", file=sys.stderr)
@@ -115,10 +137,28 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        good = parse_dotenv(args.good)
-        bad = parse_dotenv(args.bad)
-        all_changes = diff_envs(good, bad)
-        managed_keys = tuple(sorted(set(good) | set(bad)))
+        inferred = args.format
+        if inferred == "auto":
+            inferred = "dotenv" if Path(args.good).suffix.lower() in {"", ".env"} else detect_format(args.good)
+        structured = inferred != "dotenv"
+        if structured and not args.config_output:
+            raise EnvCauseError("--config-output is required for JSON/YAML/TOML reduction")
+        if not structured and args.config_output:
+            raise EnvCauseError("--config-output is only used with JSON/YAML/TOML files")
+        if structured:
+            output_path = Path(args.config_output).resolve()
+            inputs = {Path(args.good).resolve(), Path(args.bad).resolve()}
+            if output_path in inputs:
+                raise EnvCauseError("--config-output must not overwrite a good or bad input file")
+            good = load_config(args.good, inferred)
+            bad = load_config(args.bad, inferred)
+            all_changes = diff_configs(good, bad)
+            managed_keys: tuple[str, ...] = ()
+        else:
+            good = parse_dotenv(args.good)
+            bad = parse_dotenv(args.bad)
+            all_changes = diff_envs(good, bad)
+            managed_keys = tuple(sorted(set(good) | set(bad)))
         adapter = None
         if args.docker_image:
             adapter = DockerAdapter(
@@ -139,6 +179,9 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 72)
         print(f"Good config : {Path(args.good)}")
         print(f"Bad config  : {Path(args.bad)}")
+        print(f"Format      : {inferred}")
+        if structured:
+            print(f"Candidate   : {args.config_output}")
         print(f"Differences : {len(all_changes)}")
         print(f"Command     : {' '.join(command)}")
         print(f"Execution   : {adapter.description if adapter else 'local process'}")
@@ -177,13 +220,27 @@ def main(argv: list[str] | None = None) -> int:
             cache_path=args.cache_file,
             progress=show_progress if args.progress else None,
             adapter=adapter,
+            changes_override=all_changes if structured else None,
+            candidate_setup=(
+                lambda subset: write_config(args.config_output, build_config(good, subset), inferred)
+            ) if structured else None,
+            inject_environment=not structured,
+            cache_identity={
+                "format": inferred,
+                "good": good,
+                "bad": bad,
+                "output": str(Path(args.config_output).resolve()),
+            } if structured else None,
         )
+        if structured:
+            write_config(args.config_output, build_config(good, result.changes), inferred)
 
         print()
         print("Result")
         print("-" * 72)
-        print(f"Original differing variables : {len(all_changes)}")
-        print(f"Failure-inducing variables    : {len(result.changes)}")
+        unit = "paths" if structured else "variables"
+        print(f"Original differing {unit:<9}: {len(all_changes)}")
+        print(f"Failure-inducing {unit:<9}   : {len(result.changes)}")
         print(f"Command executions            : {result.total_runs}")
         if result.cache_hits:
             print(f"Cached candidate results      : {result.cache_hits}")
@@ -195,12 +252,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {change.key}: {good_value} -> {bad_value}")
 
         print()
-        print("Bad-state reproduction:")
-        for change in result.changes:
-            print(f"  {shell_assignment(change, show_values=args.show_values)}")
+        if structured:
+            print(f"Minimal candidate written to: {args.config_output}")
+        else:
+            print("Bad-state reproduction:")
+            for change in result.changes:
+                print(f"  {shell_assignment(change, show_values=args.show_values)}")
 
         if args.write_repro:
-            write_repro(args.write_repro, result.changes)
+            if structured:
+                repro_format = inferred if Path(args.write_repro).suffix == "" else detect_format(args.write_repro)
+                write_config(args.write_repro, build_config(good, result.changes), repro_format)
+            else:
+                write_repro(args.write_repro, result.changes)
             print()
             print(f"Wrote reproduction config: {args.write_repro}")
             if not args.show_values:
@@ -211,6 +275,9 @@ def main(argv: list[str] | None = None) -> int:
                 "schema_version": 1,
                 "good_config": str(Path(args.good)),
                 "bad_config": str(Path(args.bad)),
+                "config_format": inferred,
+                "config_output": args.config_output,
+                "reproduction_config": args.write_repro,
                 "command": command,
                 "execution": dict(adapter.cache_identity) if adapter else {"type": "local"},
                 "failure_match": (
