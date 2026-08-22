@@ -67,9 +67,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat the run as failing when this JUnit XML report contains a failure or error",
     )
     parser.add_argument("--repeat", type=int, default=1, help="Require failure to reproduce N times (default: 1)")
+    parser.add_argument(
+        "--verify-repeat",
+        type=int,
+        metavar="N",
+        help="Verify the known-good and known-bad baselines N times before reducing (default: --repeat)",
+    )
     parser.add_argument("--timeout", type=float, help="Per-run timeout in seconds")
     parser.add_argument("--cwd", help="Working directory for the reproduction command")
     parser.add_argument("--max-tests", type=int, help="Maximum candidate subsets tested during reduction")
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Test up to N candidates concurrently during reduction (default: 1); "
+            "not supported for JSON/YAML/TOML configs, --junit, or --kube-pod"
+        ),
+    )
     parser.add_argument(
         "--no-cache",
         action="store_true",
@@ -195,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Failure     : non-zero exit code")
         if args.repeat > 1:
             print(f"Repeat      : {args.repeat} consecutive reproductions required")
+        if args.verify_repeat is not None and args.verify_repeat != args.repeat:
+            print(f"Verify      : {args.verify_repeat} baseline reproductions required")
+        if args.parallel > 1:
+            print(f"Parallel    : up to {args.parallel} concurrent candidates")
         print()
         print("Verifying known-good and known-bad configs, then reducing...")
 
@@ -215,7 +235,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             cwd=args.cwd,
             repeat=args.repeat,
+            verify_repeat=args.verify_repeat,
             max_tests=args.max_tests,
+            parallel=args.parallel,
             cache=not args.no_cache,
             cache_path=args.cache_file,
             progress=show_progress if args.progress else None,

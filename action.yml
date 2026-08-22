@@ -54,6 +54,12 @@ inputs:
     description: Number of consecutive reproductions required
     required: false
     default: "1"
+  verify-repeat:
+    description: "Number of times to verify the known-good and known-bad baselines before reducing (default: repeat)"
+    required: false
+  parallel:
+    description: "Test up to this many candidates concurrently during reduction; not supported for JSON/YAML/TOML configs, junit, or kube-pod (default: 1)"
+    required: false
   timeout:
     description: Per-run timeout in seconds
     required: false
@@ -134,6 +140,8 @@ runs:
         INPUT_MATCHES: ${{ inputs.matches }}
         INPUT_JUNIT: ${{ inputs.junit }}
         INPUT_REPEAT: ${{ inputs.repeat }}
+        INPUT_VERIFY_REPEAT: ${{ inputs.verify-repeat }}
+        INPUT_PARALLEL: ${{ inputs.parallel }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_CWD: ${{ inputs.cwd }}
         INPUT_MAX_TESTS: ${{ inputs.max-tests }}

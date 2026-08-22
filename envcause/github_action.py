@@ -81,6 +81,8 @@ def build_argv() -> tuple[list[str], Path, Path | None]:
         "--matches": _input("MATCHES"),
         "--junit": _input("JUNIT"),
         "--repeat": _input("REPEAT"),
+        "--verify-repeat": _input("VERIFY_REPEAT"),
+        "--parallel": _input("PARALLEL"),
         "--timeout": _input("TIMEOUT"),
         "--cwd": _input("CWD"),
         "--max-tests": _input("MAX_TESTS"),

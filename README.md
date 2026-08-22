@@ -148,6 +148,21 @@ envcause --good good.env --bad bad.env --repeat 3 -- pytest -q
 
 A candidate counts as failing only if it reproduces on every repeat.
 
+For nondeterministic systems, verify the known-good and known-bad baselines
+with a different number of runs than the reduction itself uses:
+
+```bash
+envcause --good good.env --bad bad.env --repeat 1 --verify-repeat 5 -- pytest -q
+```
+
+`--verify-repeat` defaults to `--repeat`. Raising it strengthens confidence
+that the good baseline never fails and the bad baseline always fails before
+spending many candidate runs on the reduction; keeping `--repeat` low keeps
+the search itself fast. A single flaky sample on either baseline no longer
+misclassifies it: the good baseline must fail on every verification run to
+be rejected as already broken, and the bad baseline must fail on every
+verification run to be trusted as reproducing.
+
 ### Write a small reproduction file
 
 ```bash
@@ -214,6 +229,23 @@ envcause --good good.env --bad bad.env --progress -- pytest -q
 
 Progress is written to stderr and shows the candidate number, number of changed
 variables or paths, command-run count, and whether the result came from cache.
+
+### Test candidates in parallel
+
+```bash
+envcause --good good.env --bad bad.env --parallel 4 -- pytest -q
+```
+
+Each delta-debugging round tests every chunk it needs to check against the
+same baseline, so those checks run concurrently instead of one at a time.
+The result is identical to a sequential run; only the wall-clock time changes.
+
+`--parallel` requires candidates that do not share state with each other:
+it is rejected for JSON, YAML, and TOML reduction (every candidate would
+overwrite the same `--config-output` file), for `--junit` (concurrent runs
+would share the same report path), and for `--kube-pod` (candidates share
+the pod). It works with plain `.env` reduction and with `--docker-image`,
+where every candidate already gets an independent container.
 
 ## Docker and Kubernetes
 
@@ -371,13 +403,13 @@ Completed:
 - [x] JSON, YAML, and TOML reduction
 - [x] Docker, Kubernetes, and GitHub Actions integration
 - [x] `envcause explain` terminal and Markdown reports
+- [x] Multiple known-good and known-bad verification runs for nondeterministic
+      systems (`--verify-repeat`)
+- [x] Parallel candidate execution (`--parallel`), for `.env` and Docker
+      reduction
 
-Potential next steps, in suggested order:
-
-1. Multiple known-good and known-bad verification runs for nondeterministic
-   systems.
-2. Parallel candidate execution. Structured candidates need isolated per-run
-   files, so this requires more execution-model work than baseline verification.
+No further steps are currently planned; open an issue with a proposal if
+you have one.
 
 ## Development
 

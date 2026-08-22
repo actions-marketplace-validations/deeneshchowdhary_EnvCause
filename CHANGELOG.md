@@ -2,6 +2,16 @@
 
 All notable changes to EnvCause are documented here.
 
+## 0.4.0 - 2026-08-22
+
+### Added
+
+- `--verify-repeat` to verify the known-good and known-bad baselines a
+  different number of times than `--repeat` uses during reduction, for
+  nondeterministic systems
+- `--parallel` to test multiple candidates concurrently during reduction, for
+  `.env` and Docker reduction
+
 ## 0.3.0 - 2026-08-13
 
 ### Added

@@ -5,6 +5,7 @@ import json
 import io
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -12,7 +13,17 @@ from unittest.mock import patch
 
 from envcause.adapters import DockerAdapter, KubernetesAdapter
 from envcause.cli import main
-from envcause.core import EnvCauseError, diff_envs, parse_dotenv, redact_value, reduce_environment, run_command, write_repro
+from envcause.core import (
+    EnvChange,
+    EnvCauseError,
+    ddmin,
+    diff_envs,
+    parse_dotenv,
+    redact_value,
+    reduce_environment,
+    run_command,
+    write_repro,
+)
 from envcause.github_action import build_argv as build_github_action_argv, run as run_github_action
 from envcause.structured import build_config, diff_configs, load_config
 
@@ -276,6 +287,63 @@ class ReductionTests(unittest.TestCase):
         self.assertGreater(cached.cache_hits, 0)
         self.assertLess(cached.total_runs, uncached.total_runs)
 
+    def test_verify_repeat_tolerates_a_one_off_baseline_flake(self):
+        # The known-good state itself flakes and fails on the very first sample,
+        # then behaves correctly on every later sample. A single verification run
+        # (the default) is fooled by that one sample; more verification runs are
+        # not, and let the reduction proceed to its real, deterministic answer.
+        good = {"A": "0", "B": "0"}
+        bad = {"A": "1", "B": "1"}
+        counter_path = Path(tempfile.mkdtemp()) / "good_state_calls"
+        counter_path.write_text("0", encoding="utf-8")
+        code = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            f"counter_path = Path({str(counter_path)!r})\n"
+            "good_state = os.getenv('A') == '0' and os.getenv('B') == '0'\n"
+            "bad_state = os.getenv('A') == '1' and os.getenv('B') == '1'\n"
+            "n = 0\n"
+            "if good_state:\n"
+            "    n = int(counter_path.read_text()) + 1\n"
+            "    counter_path.write_text(str(n))\n"
+            "sys.exit(1 if bad_state or (good_state and n == 1) else 0)\n"
+        )
+        with self.assertRaises(EnvCauseError) as ctx:
+            reduce_environment(good, bad, [sys.executable, "-c", code], cache=False)
+        self.assertIn("Known-good", str(ctx.exception))
+
+        counter_path.write_text("0", encoding="utf-8")
+        result = reduce_environment(
+            good, bad, [sys.executable, "-c", code], verify_repeat=3, cache=False,
+        )
+        self.assertEqual({c.key for c in result.changes}, {"A", "B"})
+
+    def test_verify_repeat_rejects_values_below_one(self):
+        good = {"A": "0"}
+        bad = {"A": "1"}
+        with self.assertRaises(EnvCauseError):
+            reduce_environment(
+                good, bad, [sys.executable, "-c", "import sys; sys.exit(0)"],
+                verify_repeat=0, cache=False,
+            )
+
+    def test_cli_accepts_verify_repeat_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            good = root / "good.env"
+            bad = root / "bad.env"
+            good.write_text("A=0\n", encoding="utf-8")
+            bad.write_text("A=1\n", encoding="utf-8")
+            code = "import os,sys; sys.exit(1 if os.getenv('A') == '1' else 0)"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main([
+                    "--good", str(good), "--bad", str(bad),
+                    "--verify-repeat", "2", "--", sys.executable, "-c", code,
+                ])
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Verify      : 2 baseline reproductions required", stdout.getvalue())
+
     def test_diff_includes_added_and_removed_keys(self):
         changes = diff_envs({"A": "1", "B": "2"}, {"A": "9", "C": "3"})
         self.assertEqual([c.key for c in changes], ["A", "B", "C"])
@@ -426,6 +494,109 @@ class ReductionTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             data = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(data["changes"][0]["bad"], "<REDACTED>")
+
+
+class ParallelReductionTests(unittest.TestCase):
+    def test_ddmin_tests_a_rounds_chunks_concurrently(self):
+        # Four items force a first round with two same-size chunks. If both chunks
+        # are not actually dispatched to separate threads, the barrier below never
+        # reaches its required party count and times out.
+        items = [EnvChange(key=f"K{i}", good="0", bad=str(i)) for i in range(4)]
+        barrier = threading.Barrier(2)
+
+        def fails(subset):
+            if len(subset) == 2:
+                barrier.wait(timeout=2)
+            return False
+
+        ddmin(items, fails, max_workers=2)
+
+    def test_parallel_reduction_matches_sequential_result(self):
+        good = {f"V{i}": "0" for i in range(6)}
+        bad = {f"V{i}": "1" for i in range(6)}
+        code = (
+            "import os,sys; "
+            "sys.exit(1 if os.getenv('V0') == '1' and os.getenv('V3') == '1' else 0)"
+        )
+        sequential = reduce_environment(good, bad, [sys.executable, "-c", code], cache=False)
+        parallel = reduce_environment(
+            good, bad, [sys.executable, "-c", code], cache=False, parallel=4,
+        )
+        self.assertEqual({c.key for c in sequential.changes}, {"V0", "V3"})
+        self.assertEqual({c.key for c in parallel.changes}, {"V0", "V3"})
+
+    def test_parallel_rejects_values_below_one(self):
+        good = {"A": "0"}
+        bad = {"A": "1"}
+        with self.assertRaises(EnvCauseError):
+            reduce_environment(
+                good, bad, [sys.executable, "-c", "import sys; sys.exit(0)"],
+                parallel=0, cache=False,
+            )
+
+    def test_parallel_rejects_shared_candidate_setup(self):
+        good = {"A": "0"}
+        bad = {"A": "1"}
+        with self.assertRaises(EnvCauseError) as ctx:
+            reduce_environment(
+                good, bad, [sys.executable, "-c", "import sys; sys.exit(1)"],
+                parallel=2, cache=False, candidate_setup=lambda subset: None,
+            )
+        self.assertIn("--config-output", str(ctx.exception))
+
+    def test_parallel_rejects_junit(self):
+        good = {"A": "0"}
+        bad = {"A": "1"}
+        with self.assertRaises(EnvCauseError) as ctx:
+            reduce_environment(
+                good, bad, [sys.executable, "-c", "import sys; sys.exit(1)"],
+                parallel=2, cache=False, junit="report.xml",
+            )
+        self.assertIn("--junit", str(ctx.exception))
+
+    def test_parallel_rejects_non_parallel_safe_adapter(self):
+        good = {"A": "0"}
+        bad = {"A": "1"}
+        adapter = KubernetesAdapter(pod="api-0", managed_keys=("A",))
+        with self.assertRaises(EnvCauseError) as ctx:
+            reduce_environment(
+                good, bad, [sys.executable, "-c", "import sys; sys.exit(1)"],
+                parallel=2, cache=False, adapter=adapter,
+            )
+        self.assertIn("Kubernetes pod", str(ctx.exception))
+
+    def test_cli_accepts_parallel_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            good = root / "good.env"
+            bad = root / "bad.env"
+            good.write_text("A=0\n", encoding="utf-8")
+            bad.write_text("A=1\n", encoding="utf-8")
+            code = "import os,sys; sys.exit(1 if os.getenv('A') == '1' else 0)"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main([
+                    "--good", str(good), "--bad", str(bad),
+                    "--parallel", "2", "--", sys.executable, "-c", code,
+                ])
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Parallel    : up to 2 concurrent candidates", stdout.getvalue())
+
+    def test_cli_rejects_parallel_with_kube_pod(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            good = root / "good.env"
+            bad = root / "bad.env"
+            good.write_text("A=0\n", encoding="utf-8")
+            bad.write_text("A=1\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                exit_code = main([
+                    "--good", str(good), "--bad", str(bad), "--kube-pod", "api-0",
+                    "--parallel", "2", "--", "python", "app.py",
+                ])
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--parallel is not supported", stderr.getvalue())
 
 
 class GitHubActionTests(unittest.TestCase):

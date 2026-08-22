@@ -35,6 +35,11 @@ class DockerAdapter:
             "executable": self.executable,
         }
 
+    @property
+    def parallel_safe(self) -> bool:
+        # Each candidate starts a fresh, independent container.
+        return True
+
     def prepare(
         self,
         command: Sequence[str],
@@ -93,6 +98,11 @@ class KubernetesAdapter:
             "context": self.context,
             "executable": self.executable,
         }
+
+    @property
+    def parallel_safe(self) -> bool:
+        # Candidates share the same existing pod/container.
+        return False
 
     def prepare(
         self,

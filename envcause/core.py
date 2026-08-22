@@ -7,8 +7,10 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
@@ -46,6 +48,9 @@ class ExecutionAdapter(Protocol):
 
     @property
     def cache_identity(self) -> Mapping[str, object]: ...
+
+    @property
+    def parallel_safe(self) -> bool: ...
 
     def prepare(
         self,
@@ -308,11 +313,16 @@ def ddmin(
     fails,
     *,
     max_tests: int | None = None,
+    max_workers: int = 1,
 ) -> tuple[list[EnvChange], int]:
     """Classic delta debugging reduction.
 
     `fails(candidate)` must return True when candidate reproduces the target failure.
     The result is 1-minimal: removing any single remaining change no longer reproduces.
+
+    With `max_workers` above 1, every chunk (or complement) within a round is tested
+    concurrently instead of stopping at the first match; the first match in the
+    original order still wins, so the result is identical to the sequential run.
     """
     if not items:
         return [], 0
@@ -320,39 +330,51 @@ def ddmin(
     candidate = list(items)
     n = 2
     tests = 0
+    test_lock = threading.Lock()
 
     def check(subset: list[EnvChange]) -> bool:
         nonlocal tests
-        if max_tests is not None and tests >= max_tests:
-            raise EnvCauseError(f"Maximum reduction tests reached ({max_tests})")
-        tests += 1
+        with test_lock:
+            if max_tests is not None and tests >= max_tests:
+                raise EnvCauseError(f"Maximum reduction tests reached ({max_tests})")
+            tests += 1
         return bool(fails(subset))
+
+    def first_match(subsets: list[list[EnvChange]]) -> list[EnvChange] | None:
+        if max_workers <= 1 or len(subsets) <= 1:
+            for subset in subsets:
+                if check(subset):
+                    return subset
+            return None
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(subsets))) as executor:
+            results = list(executor.map(check, subsets))
+        for subset, result in zip(subsets, results):
+            if result:
+                return subset
+        return None
 
     while len(candidate) >= 2:
         chunk_size = math.ceil(len(candidate) / n)
         chunks = [candidate[i : i + chunk_size] for i in range(0, len(candidate), chunk_size)]
-        reduced = False
 
         # First see whether one chunk alone is sufficient.
-        for chunk in chunks:
-            if check(chunk):
-                candidate = chunk
-                n = max(n - 1, 2)
-                reduced = True
-                break
-        if reduced:
+        match = first_match(chunks)
+        if match is not None:
+            candidate = match
+            n = max(n - 1, 2)
             continue
 
         # Then see whether removing a chunk preserves the failure.
+        complements = []
         for chunk in chunks:
             chunk_ids = {id(x) for x in chunk}
             complement = [x for x in candidate if id(x) not in chunk_ids]
-            if complement and check(complement):
-                candidate = complement
-                n = max(n - 1, 2)
-                reduced = True
-                break
-        if reduced:
+            if complement:
+                complements.append(complement)
+        match = first_match(complements)
+        if match is not None:
+            candidate = match
+            n = max(n - 1, 2)
             continue
 
         if n >= len(candidate):
@@ -360,7 +382,9 @@ def ddmin(
         n = min(len(candidate), n * 2)
 
     # ddmin should be 1-minimal already, but this final pass makes the guarantee
-    # explicit and easier to reason about for small configuration sets.
+    # explicit and easier to reason about for small configuration sets. Each check
+    # depends on the candidate left by the previous one, so it stays sequential
+    # even when max_workers is above 1.
     i = 0
     while i < len(candidate):
         complement = candidate[:i] + candidate[i + 1 :]
@@ -383,7 +407,9 @@ def reduce_environment(
     timeout: float | None = None,
     cwd: str | None = None,
     repeat: int = 1,
+    verify_repeat: int | None = None,
     max_tests: int | None = None,
+    parallel: int = 1,
     process_env: Mapping[str, str] | None = None,
     cache: bool = True,
     cache_path: str | os.PathLike[str] | None = None,
@@ -403,6 +429,27 @@ def reduce_environment(
             re.compile(matches)
         except re.error as exc:
             raise EnvCauseError(f"Invalid failure regex: {exc}") from exc
+
+    if verify_repeat is not None and verify_repeat < 1:
+        raise EnvCauseError("--verify-repeat must be at least 1")
+    baseline_repeat = repeat if verify_repeat is None else verify_repeat
+
+    if parallel < 1:
+        raise EnvCauseError("--parallel must be at least 1")
+    if parallel > 1:
+        if candidate_setup is not None:
+            raise EnvCauseError(
+                "--parallel cannot be combined with a shared candidate configuration file "
+                "(JSON/YAML/TOML reduction writes each candidate to --config-output)"
+            )
+        if junit is not None:
+            raise EnvCauseError(
+                "--parallel cannot be combined with --junit because concurrent runs would share the report path"
+            )
+        if adapter is not None and not adapter.parallel_safe:
+            raise EnvCauseError(
+                f"--parallel is not supported with {adapter.description} because candidates share the same execution target"
+            )
 
     process_env = process_env or os.environ
     changes = list(changes_override) if changes_override is not None else diff_envs(good, bad)
@@ -427,7 +474,7 @@ def reduce_environment(
         junit=junit,
         timeout=timeout,
         cwd=cwd,
-        repeat=repeat,
+        repeat=baseline_repeat,
         adapter=adapter,
         before_run=setup_for([]),
     )
@@ -443,7 +490,7 @@ def reduce_environment(
         junit=junit,
         timeout=timeout,
         cwd=cwd,
-        repeat=repeat,
+        repeat=baseline_repeat,
         adapter=adapter,
         before_run=setup_for(changes),
     )
@@ -456,16 +503,11 @@ def reduce_environment(
     candidate_cache: dict[frozenset[str], bool] = {}
     persistent_cache = _load_cache(cache_path) if cache and cache_path else {}
     logical_tests = 0
+    state_lock = threading.Lock()
 
     def fails(subset: Sequence[EnvChange]) -> bool:
         nonlocal command_runs, cache_hits, logical_tests
-        logical_tests += 1
         cache_key = frozenset(change.key for change in subset)
-        if cache and cache_key in candidate_cache:
-            cache_hits += 1
-            if progress:
-                progress(logical_tests, command_runs, len(subset), True)
-            return candidate_cache[cache_key]
         persistent_key = _candidate_hash(
             command,
             env_for(subset),
@@ -478,12 +520,24 @@ def reduce_environment(
             adapter_identity=adapter.cache_identity if adapter else None,
             extra_identity={**(cache_identity or {}), "changes": sorted(change.key for change in subset)},
         )
-        if cache and persistent_key in persistent_cache:
-            cache_hits += 1
-            candidate_cache[cache_key] = persistent_cache[persistent_key]
-            if progress:
-                progress(logical_tests, command_runs, len(subset), True)
-            return persistent_cache[persistent_key]
+
+        with state_lock:
+            logical_tests += 1
+            test_no = logical_tests
+            if cache and cache_key in candidate_cache:
+                cache_hits += 1
+                result = candidate_cache[cache_key]
+                if progress:
+                    progress(test_no, command_runs, len(subset), True)
+                return result
+            if cache and persistent_key in persistent_cache:
+                cache_hits += 1
+                result = persistent_cache[persistent_key]
+                candidate_cache[cache_key] = result
+                if progress:
+                    progress(test_no, command_runs, len(subset), True)
+                return result
+
         failed, _, used = reproduce(
             command,
             env_for(subset),
@@ -496,15 +550,17 @@ def reduce_environment(
             adapter=adapter,
             before_run=setup_for(subset),
         )
-        command_runs += used
-        if cache:
-            candidate_cache[cache_key] = failed
-            persistent_cache[persistent_key] = failed
-        if progress:
-            progress(logical_tests, command_runs, len(subset), False)
+
+        with state_lock:
+            command_runs += used
+            if cache:
+                candidate_cache[cache_key] = failed
+                persistent_cache[persistent_key] = failed
+            if progress:
+                progress(test_no, command_runs, len(subset), False)
         return failed
 
-    reduced, _logical_tests = ddmin(changes, fails, max_tests=max_tests)
+    reduced, _logical_tests = ddmin(changes, fails, max_tests=max_tests, max_workers=parallel)
     if cache and cache_path:
         _write_cache(cache_path, persistent_cache)
     return ReductionResult(
